@@ -11,11 +11,22 @@ from flask import Flask, request, render_template_string, jsonify, redirect, url
 
 # ========== Config ==========
 BASE_DIR = os.path.dirname(__file__)
-WATCH_PATH = r"C:\Users\VEDANT\Desktop\Data_Exfiltration\watch"
+# original watch folder (ingress / monitored folder)
+WATCH_FOLDER = r"C:\Users\VEDANT\Desktop\Data_Exfiltration\watch"
+# add your USB drive here (D:\ as requested)
+USB_DRIVE = r"D:\\"
+# we will monitor both
+WATCH_PATHS = [WATCH_FOLDER, USB_DRIVE]
+
 QUARANTINE_FOLDER = os.path.join(BASE_DIR, "quarantine")
 STATE_FILE = os.path.join(BASE_DIR, "dlp_state.json")
 os.makedirs(QUARANTINE_FOLDER, exist_ok=True)
-os.makedirs(WATCH_PATH, exist_ok=True)
+for p in WATCH_PATHS:
+    try:
+        os.makedirs(p, exist_ok=True)
+    except Exception:
+        # if path is a root drive (like D:\) os.makedirs will raise; ignore
+        pass
 
 PATTERNS = {
     "Aadhaar": r"\b\d{4}\s\d{4}\s\d{4}\b",
@@ -171,9 +182,11 @@ class DLPHandler(FileSystemEventHandler):
 
             fname = os.path.basename(path)
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            alert = {"file": path, "rule": rule, "time": ts, "status": state.get("policy_mode", "block")}
+            # include origin info (which watched path likely triggered this)
+            origin = _identify_origin(path)
+            alert = {"file": path, "rule": rule, "time": ts, "status": state.get("policy_mode", "block"), "origin": origin}
             add_alert(alert)
-            print(f"[ALERT] {path} matched {rule} (policy: {state.get('policy_mode')})")
+            print(f"[ALERT] {path} matched {rule} (policy: {state.get('policy_mode')}) origin:{origin}")
             if state.get("policy_mode") == "block":
                 # move to quarantine
                 try:
@@ -212,9 +225,10 @@ class DLPHandler(FileSystemEventHandler):
             _mark_processed(dest)
             fname = os.path.basename(dest)
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            alert = {"file": dest, "rule": rule, "time": ts, "status": state.get("policy_mode", "block")}
+            origin = _identify_origin(dest)
+            alert = {"file": dest, "rule": rule, "time": ts, "status": state.get("policy_mode", "block"), "origin": origin}
             add_alert(alert)
-            print(f"[ALERT] {dest} matched {rule} (policy: {state.get('policy_mode')})")
+            print(f"[ALERT] {dest} matched {rule} (policy: {state.get('policy_mode')}) origin:{origin}")
             if state.get("policy_mode") == "block":
                 try:
                     qdest = os.path.join(QUARANTINE_FOLDER, f"{int(time.time())}_{fname}")
@@ -229,8 +243,22 @@ class DLPHandler(FileSystemEventHandler):
                 print("[ACTION] Warn mode - file left in place")
                 save_state(state)
 
+# utility: try to give a hint whether event came from watch folder or USB
+def _identify_origin(path):
+    try:
+        path_abs = os.path.abspath(path).lower()
+        for p in WATCH_PATHS:
+            try:
+                if os.path.commonpath([os.path.abspath(p).lower(), path_abs]) == os.path.abspath(p).lower():
+                    return p
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return "unknown"
+
 # ========== Watcher thread ==========
-def start_watcher(path):
+def start_watcher_for_path(path):
     handler = DLPHandler()
     observer = Observer()
     observer.schedule(handler, path=path, recursive=True)
@@ -279,13 +307,14 @@ TEMPLATE = """
 
   <h3>Alerts (most recent first) — Total: {{ alerts|length }}</h3>
   <table>
-    <tr><th>File</th><th>Rule</th><th>Time</th><th>Status</th><th>Actions</th></tr>
+    <tr><th>File</th><th>Rule</th><th>Time</th><th>Status</th><th>Origin</th><th>Actions</th></tr>
     {% for a in alerts %}
     <tr>
       <td style="word-break:break-all">{{ a.file }}</td>
       <td>{{ a.rule }}</td>
       <td>{{ a.time }}</td>
       <td>{{ a.status }}</td>
+      <td>{{ a.origin if a.origin else "unknown" }}</td>
       <td>
         <form style="display:inline" method="post" action="{{ url_for('allow_file') }}">
           <input type="hidden" name="file" value="{{ a.file }}"/>
@@ -301,6 +330,7 @@ TEMPLATE = """
   </table>
 
   <p class="small">Quarantine folder: {{ quarantine }}</p>
+  <p class="small">Watching paths: {{ watch_paths }}</p>
 </body>
 </html>
 """
@@ -311,7 +341,8 @@ def index():
                                   alerts=state.get("alerts", []),
                                   whitelist=state.get("whitelist", []),
                                   policy=state.get("policy_mode", "block"),
-                                  quarantine=QUARANTINE_FOLDER)
+                                  quarantine=QUARANTINE_FOLDER,
+                                  watch_paths=WATCH_PATHS)
 
 @app.route("/toggle_policy")
 def toggle_policy():
@@ -341,10 +372,10 @@ def remove_whitelist():
 @app.route("/allow_file", methods=["POST"])
 def allow_file():
     fpath = request.form.get("file")
-    # if file is in quarantine, move it back to watch and add to whitelist
+    # if file is in quarantine, move it back to watch (default) and add to whitelist
     try:
         if fpath and os.path.exists(fpath):
-            dest = os.path.join(WATCH_PATH, os.path.basename(fpath))
+            dest = os.path.join(WATCH_FOLDER, os.path.basename(fpath))
             os.replace(fpath, dest)
             # add the destination to whitelist so it won't be re-blocked
             if dest not in state.get("whitelist", []):
@@ -372,15 +403,18 @@ def start_flask():
 
 # ========== Main ==========
 if __name__ == "__main__":
-    # sanity checks
-    if not os.path.isdir(WATCH_PATH):
-        print(f"[ERROR] Watch folder does not exist: {WATCH_PATH}")
-        print("Create it and try again.")
-        raise SystemExit(1)
+    # sanity checks: ensure watch paths exist (at least log if they don't)
+    for p in WATCH_PATHS:
+        if not os.path.exists(p):
+            print(f"[WARN] Watch path does not exist or is inaccessible: {p}")
+    # start one watcher thread per watched path
+    threads = []
+    for p in WATCH_PATHS:
+        t = threading.Thread(target=start_watcher_for_path, args=(p,), daemon=True)
+        t.start()
+        threads.append(t)
 
-    t1 = threading.Thread(target=start_watcher, args=(WATCH_PATH,), daemon=True)
     t2 = threading.Thread(target=start_flask, daemon=True)
-    t1.start()
     t2.start()
     print("[INFO] DLP agent + dashboard started. Open http://127.0.0.1:5000")
     try:
