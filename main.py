@@ -17,8 +17,6 @@ WATCH_FOLDER = r"C:\Users\VEDANT\Desktop\Data_Exfiltration\watch"
 # add your USB drive here (D:\ as requested)
 USB_DRIVE = r"D:\\"
 
-# IMPORTANT: Enable USB monitoring only if you're sure D:\ is your USB drive
-# and not a system partition. Check in File Explorer first!
 ENABLE_USB_MONITORING = True  # Set to True to enable USB monitoring
 
 # Build watch paths based on config
