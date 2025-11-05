@@ -4,29 +4,43 @@ import os
 import threading
 import time
 import json
+import shutil
 from datetime import datetime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for
 
 # ========== Config ==========
-BASE_DIR = os.path.dirname(__file__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # original watch folder (ingress / monitored folder)
 WATCH_FOLDER = r"C:\Users\VEDANT\Desktop\Data_Exfiltration\watch"
 # add your USB drive here (D:\ as requested)
 USB_DRIVE = r"D:\\"
-# we will monitor both
-WATCH_PATHS = [WATCH_FOLDER, USB_DRIVE]
+
+# IMPORTANT: Enable USB monitoring only if you're sure D:\ is your USB drive
+# and not a system partition. Check in File Explorer first!
+ENABLE_USB_MONITORING = True  # Set to True to enable USB monitoring
+
+# Build watch paths based on config
+WATCH_PATHS = [WATCH_FOLDER]
+if ENABLE_USB_MONITORING and os.path.exists(USB_DRIVE):
+    WATCH_PATHS.append(USB_DRIVE)
+    print(f"[CONFIG] USB monitoring ENABLED for: {USB_DRIVE}")
+else:
+    print(f"[CONFIG] USB monitoring DISABLED (set ENABLE_USB_MONITORING=True to enable)")
 
 QUARANTINE_FOLDER = os.path.join(BASE_DIR, "quarantine")
 STATE_FILE = os.path.join(BASE_DIR, "dlp_state.json")
+TEMP_TEST_FOLDER = os.path.join(BASE_DIR, "temp_test_files")  # Ignore test file generation folder
+
 os.makedirs(QUARANTINE_FOLDER, exist_ok=True)
 for p in WATCH_PATHS:
     try:
-        os.makedirs(p, exist_ok=True)
-    except Exception:
+        if not os.path.exists(p):
+            os.makedirs(p, exist_ok=True)
+    except Exception as e:
         # if path is a root drive (like D:\) os.makedirs will raise; ignore
-        pass
+        print(f"[WARN] Cannot create {p}: {e}")
 
 PATTERNS = {
     "Aadhaar": r"\b\d{4}\s\d{4}\s\d{4}\b",
@@ -37,10 +51,14 @@ PATTERNS = {
 
 # Default state
 default_state = {
-    "policy_mode": "block",   # "block" or "warn"
-    "whitelist": [],         # list of file paths or directory paths
-    "alerts": []             # stored alerts (most recent first)
+    "policy_mode": "block",  # "block" or "warn"
+    "whitelist": [],  # list of file paths or directory paths
+    "alerts": []  # stored alerts (most recent first)
 }
+
+# Thread lock for state access
+state_lock = threading.Lock()
+
 
 # ========== Load / Save state ==========
 def load_state():
@@ -48,9 +66,10 @@ def load_state():
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] Could not load state: {e}")
     return default_state.copy()
+
 
 def save_state(state):
     try:
@@ -59,42 +78,71 @@ def save_state(state):
     except Exception as e:
         print(f"[WARN] Could not save state: {e}")
 
+
 state = load_state()
+
 
 # Helper to add alert (keeps newest at front)
 def add_alert(entry):
-    state_alerts = state.get("alerts", [])
-    state_alerts.insert(0, entry)
-    # keep only recent 200 alerts
-    state["alerts"] = state_alerts[:200]
-    save_state(state)
+    with state_lock:
+        state_alerts = state.get("alerts", [])
+        state_alerts.insert(0, entry)
+        # keep only recent 200 alerts
+        state["alerts"] = state_alerts[:200]
+        save_state(state)
+
 
 # ========== Processed cache & helpers ==========
 _processed_cache = {}  # path -> last_handled_time (float)
-PROCESSED_TTL = 5.0    # seconds to remember a processed file
+_cache_lock = threading.Lock()
+PROCESSED_TTL = 10.0  # increased to 10 seconds to handle slower operations
+
 
 def _is_recently_processed(path):
-    now = time.time()
-    last = _processed_cache.get(os.path.abspath(path))
-    if last and (now - last) < PROCESSED_TTL:
-        return True
-    # garbage collect old keys occasionally
-    for p, t in list(_processed_cache.items()):
-        if now - t > PROCESSED_TTL * 5:
-            _processed_cache.pop(p, None)
-    return False
+    with _cache_lock:
+        now = time.time()
+        abs_path = os.path.abspath(path).lower()  # normalize case for Windows
+        last = _processed_cache.get(abs_path)
+        if last and (now - last) < PROCESSED_TTL:
+            return True
+        # garbage collect old keys occasionally
+        for p, t in list(_processed_cache.items()):
+            if now - t > PROCESSED_TTL * 5:
+                _processed_cache.pop(p, None)
+        return False
+
 
 def _mark_processed(path):
-    _processed_cache[os.path.abspath(path)] = time.time()
+    with _cache_lock:
+        _processed_cache[os.path.abspath(path).lower()] = time.time()
+
 
 def _is_quarantine_path(path):
     try:
-        return os.path.commonpath([os.path.abspath(path), os.path.abspath(QUARANTINE_FOLDER)]) == os.path.abspath(QUARANTINE_FOLDER)
+        abs_path = os.path.abspath(path)
+        abs_quar = os.path.abspath(QUARANTINE_FOLDER)
+        common = os.path.commonpath([abs_path, abs_quar])
+        return common == abs_quar
     except Exception:
         return False
 
+
+def _is_temp_test_path(path):
+    """Check if file is in the temp test folder (should be ignored)"""
+    try:
+        abs_path = os.path.abspath(path)
+        abs_temp = os.path.abspath(TEMP_TEST_FOLDER)
+        if os.path.exists(abs_temp):
+            common = os.path.commonpath([abs_path, abs_temp])
+            return common == abs_temp
+    except Exception:
+        pass
+    return False
+
+
 def _looks_like_quarantine_name(path):
     return re.match(r"^\d+_", os.path.basename(path)) is not None
+
 
 # ========== Detection ==========
 def is_whitelisted(filepath):
@@ -102,68 +150,167 @@ def is_whitelisted(filepath):
     if _is_quarantine_path(filepath):
         return True
 
+    with state_lock:
+        whitelist = state.get("whitelist", [])
+
     # check if filepath or its parent directories are whitelisted
-    for w in state.get("whitelist", []):
+    for w in whitelist:
         try:
-            if os.path.commonpath([os.path.abspath(w), os.path.abspath(filepath)]) == os.path.abspath(w):
+            abs_w = os.path.abspath(w)
+            abs_f = os.path.abspath(filepath)
+            # Check if file is under whitelisted directory
+            common = os.path.commonpath([abs_w, abs_f])
+            if common == abs_w:
                 return True
         except Exception:
             continue
     return False
 
-def wait_for_file_stable(path, timeout=5.0, poll=0.4):
+
+def wait_for_file_stable(path, timeout=8.0, poll=0.5):
     """Wait until file size is stable or timeout. Returns True if stable."""
     start = time.time()
     try:
         last_size = -1
+        stable_count = 0
         while time.time() - start <= timeout:
             if not os.path.exists(path):
-                return False
-            size = os.path.getsize(path)
-            if size == last_size:
-                return True
-            last_size = size
+                time.sleep(poll)
+                continue
+            try:
+                # Try to open file exclusively to check if it's still being written
+                with open(path, 'rb') as f:
+                    size = os.path.getsize(path)
+                    if size == last_size and size > 0:
+                        stable_count += 1
+                        if stable_count >= 3:  # Need 3 consecutive stable reads
+                            return True
+                    else:
+                        stable_count = 0
+                    last_size = size
+            except (OSError, PermissionError) as e:
+                # File might be locked, wait a bit more
+                print(f"[DEBUG] File locked, waiting: {path} ({e})")
+                stable_count = 0
             time.sleep(poll)
-    except Exception:
+    except Exception as e:
+        print(f"[DEBUG] wait_for_file_stable error: {e}")
         return False
-    return False
+    return last_size > 0  # Return True if we at least saw some content
+
 
 def contains_sensitive_data(filepath):
-    # ensure we don't scan quarantined files or files we just handled
-    if _is_quarantine_path(filepath) or _looks_like_quarantine_name(filepath):
+    # ensure we don't scan quarantined files, temp test files, or files we just handled
+    if _is_quarantine_path(filepath) or _is_temp_test_path(filepath) or _looks_like_quarantine_name(filepath):
+        return None
+
+    # Check if file exists
+    if not os.path.exists(filepath):
         return None
 
     # wait for copy to complete (helps avoid partial reads & duplicate events)
-    if not wait_for_file_stable(filepath, timeout=4.0):
-        # file never stabilized — skip for now
-        return None
+    print(f"[DEBUG] Waiting for file to stabilize: {filepath}")
+    if not wait_for_file_stable(filepath, timeout=8.0):
+        print(f"[WARN] File did not stabilize, attempting to scan anyway: {filepath}")
 
     try:
+        # Check file size first
+        file_size = os.path.getsize(filepath)
+        print(f"[DEBUG] Scanning file ({file_size} bytes): {filepath}")
+
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
+            content = f.read(5 * 1024 * 1024)  # Read max 5MB to handle larger files
+            print(f"[DEBUG] Read {len(content)} characters from {filepath}")
+
             for label, pat in PATTERNS.items():
-                if re.search(pat, content, re.IGNORECASE):
+                matches = re.findall(pat, content, re.IGNORECASE)
+                if matches:
+                    print(f"[DEBUG] Found {len(matches)} match(es) for {label} in {filepath}")
+                    print(f"[DEBUG] First match: {matches[0][:50]}")
                     return label
-    except Exception:
+
+            print(f"[DEBUG] No sensitive patterns found in {filepath}")
+    except Exception as e:
+        print(f"[WARN] Could not read {filepath}: {e}")
         return None
     return None
 
+
 class DLPHandler(FileSystemEventHandler):
+    def __init__(self, watch_path):
+        super().__init__()
+        self.watch_path = watch_path
+        print(f"[DEBUG] DLPHandler initialized for: {watch_path}")
+
     def on_created(self, event):
         if event.is_directory:
             return
-        path = event.src_path
+        print(f"[DEBUG] on_created event: {event.src_path}")
+        self._handle_file(event.src_path)
+
+    def on_modified(self, event):
+        # Handle modifications too (for when files are written in place)
+        if event.is_directory:
+            return
+        print(f"[DEBUG] on_modified event: {event.src_path}")
+        self._handle_file(event.src_path)
+
+    def on_moved(self, event):
+        # handle move events similarly (src->dest)
+        if event.is_directory:
+            return
+        print(f"[DEBUG] on_moved event: {event.src_path} -> {event.dest_path}")
+
+        # Mark source as processed to avoid duplicate handling
+        _mark_processed(event.src_path)
+
+        # Only handle the destination
+        self._handle_file(event.dest_path)
+
+    def _handle_file(self, path):
+        print(f"[DEBUG] _handle_file called for: {path}")
+
+        # CRITICAL SAFETY CHECK: Only process files within our watched directories
+        abs_path = os.path.abspath(path).lower()
+        is_in_watched_dir = False
+
+        for watch_path in WATCH_PATHS:
+            try:
+                abs_watch = os.path.abspath(watch_path).lower()
+                common = os.path.commonpath([abs_watch, abs_path])
+                if common == abs_watch:
+                    is_in_watched_dir = True
+                    break
+            except Exception:
+                continue
+
+        if not is_in_watched_dir:
+            print(f"[CRITICAL] File outside watched directories, IGNORING: {path}")
+            return
+
+        # ignore temp test folder
+        if _is_temp_test_path(path):
+            print(f"[DEBUG] Ignoring temp test folder: {path}")
+            return
 
         # ignore anything in quarantine folder
         if _is_quarantine_path(path):
+            print(f"[DEBUG] Ignoring quarantine path: {path}")
             return
 
         # drop events we already processed recently
         if _is_recently_processed(path):
+            print(f"[DEBUG] Already processed recently: {path}")
             return
 
-        # short delay to allow writes; plus wait_for_file_stable in contains_sensitive_data
-        time.sleep(0.2)
+        # short delay to allow writes
+        time.sleep(0.5)
+
+        # Check if file still exists (might have been quickly deleted/moved)
+        if not os.path.exists(path):
+            print(f"[DEBUG] File no longer exists: {path}")
+            _mark_processed(path)  # Mark as processed to avoid re-checking
+            return
 
         if is_whitelisted(path):
             print(f"[INFO] Whitelisted path, ignoring: {path}")
@@ -172,9 +319,11 @@ class DLPHandler(FileSystemEventHandler):
 
         # also skip if the filename looks like quarantine output (prevents loop)
         if _looks_like_quarantine_name(path):
+            print(f"[DEBUG] Skipping quarantine-named file: {path}")
             _mark_processed(path)
             return
 
+        print(f"[DEBUG] Starting sensitive data scan for: {path}")
         rule = contains_sensitive_data(path)
         if rule:
             # mark it as processed early to avoid duplicate handling
@@ -184,19 +333,32 @@ class DLPHandler(FileSystemEventHandler):
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             # include origin info (which watched path likely triggered this)
             origin = _identify_origin(path)
-            alert = {"file": path, "rule": rule, "time": ts, "status": state.get("policy_mode", "block"), "origin": origin}
+
+            with state_lock:
+                policy_mode = state.get("policy_mode", "block")
+
+            alert = {
+                "file": path,
+                "rule": rule,
+                "time": ts,
+                "status": policy_mode,
+                "origin": origin,
+                "original_path": path  # Store original path before quarantine
+            }
             add_alert(alert)
-            print(f"[ALERT] {path} matched {rule} (policy: {state.get('policy_mode')}) origin:{origin}")
-            if state.get("policy_mode") == "block":
+            print(f"[ALERT] {path} matched {rule} (policy: {policy_mode}) origin:{origin}")
+
+            if policy_mode == "block":
                 # move to quarantine
                 try:
                     dest = os.path.join(QUARANTINE_FOLDER, f"{int(time.time())}_{fname}")
-                    # use os.replace which is atomic on same filesystem
-                    os.replace(path, dest)
+                    shutil.move(path, dest)
                     print(f"[ACTION] Moved to quarantine: {dest}")
                     # update last alert file path to quarantine location
-                    state["alerts"][0]["file"] = dest
-                    save_state(state)
+                    with state_lock:
+                        if state["alerts"]:
+                            state["alerts"][0]["file"] = dest
+                        save_state(state)
                     # mark quarantined file processed so future events are ignored
                     _mark_processed(dest)
                 except Exception as e:
@@ -204,44 +366,9 @@ class DLPHandler(FileSystemEventHandler):
             else:
                 # warn mode: leave file but mark alert
                 print("[ACTION] Warn mode - file left in place")
-                save_state(state)
+        else:
+            print(f"[DEBUG] No sensitive data detected in: {path}")
 
-    def on_moved(self, event):
-        # handle move events similarly (src->dest)
-        if event.is_directory:
-            return
-        dest = event.dest_path
-        # ignore if in quarantine or already processed or looks like quarantine name
-        if _is_quarantine_path(dest) or _is_recently_processed(dest) or _looks_like_quarantine_name(dest):
-            return
-
-        time.sleep(0.2)
-        if is_whitelisted(dest):
-            _mark_processed(dest)
-            return
-
-        rule = contains_sensitive_data(dest)
-        if rule:
-            _mark_processed(dest)
-            fname = os.path.basename(dest)
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            origin = _identify_origin(dest)
-            alert = {"file": dest, "rule": rule, "time": ts, "status": state.get("policy_mode", "block"), "origin": origin}
-            add_alert(alert)
-            print(f"[ALERT] {dest} matched {rule} (policy: {state.get('policy_mode')}) origin:{origin}")
-            if state.get("policy_mode") == "block":
-                try:
-                    qdest = os.path.join(QUARANTINE_FOLDER, f"{int(time.time())}_{fname}")
-                    os.replace(dest, qdest)
-                    print(f"[ACTION] Moved to quarantine: {qdest}")
-                    state["alerts"][0]["file"] = qdest
-                    save_state(state)
-                    _mark_processed(qdest)
-                except Exception as e:
-                    print(f"[ERROR] Could not quarantine file (moved): {e}")
-            else:
-                print("[ACTION] Warn mode - file left in place")
-                save_state(state)
 
 # utility: try to give a hint whether event came from watch folder or USB
 def _identify_origin(path):
@@ -249,7 +376,9 @@ def _identify_origin(path):
         path_abs = os.path.abspath(path).lower()
         for p in WATCH_PATHS:
             try:
-                if os.path.commonpath([os.path.abspath(p).lower(), path_abs]) == os.path.abspath(p).lower():
+                abs_p = os.path.abspath(p).lower()
+                common = os.path.commonpath([abs_p, path_abs])
+                if common == abs_p:
                     return p
             except Exception:
                 continue
@@ -257,19 +386,44 @@ def _identify_origin(path):
         pass
     return "unknown"
 
+
 # ========== Watcher thread ==========
 def start_watcher_for_path(path):
-    handler = DLPHandler()
+    if not os.path.exists(path):
+        print(f"[ERROR] Cannot watch non-existent path: {path}")
+        return
+
+    # SAFETY CHECK: Ensure we're only watching approved directories
+    abs_path = os.path.abspath(path)
+    print(f"[SAFETY] Verifying watch path: {abs_path}")
+
+    # Verify path is in our approved list
+    approved = False
+    for approved_path in [WATCH_FOLDER, USB_DRIVE]:
+        try:
+            if abs_path.lower() == os.path.abspath(approved_path).lower():
+                approved = True
+                break
+        except:
+            pass
+
+    if not approved:
+        print(f"[CRITICAL] Refusing to watch unauthorized path: {abs_path}")
+        return
+
+    handler = DLPHandler(path)
     observer = Observer()
     observer.schedule(handler, path=path, recursive=True)
     observer.start()
-    print(f"[INFO] Watching: {path}")
+    print(f"[INFO] ✓ Actively watching: {path}")
+
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
+
 
 # ========== Flask dashboard ==========
 app = Flask(__name__)
@@ -280,145 +434,384 @@ TEMPLATE = """
   <meta charset="utf-8">
   <title>Mini DLP Dashboard</title>
   <style>
-    body{font-family:Arial;margin:20px}
-    table{width:100%;border-collapse:collapse}
-    th,td{padding:8px;border:1px solid #ccc}
+    body{font-family:Arial;margin:20px;background:#f5f5f5}
+    .container{background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
+    table{width:100%;border-collapse:collapse;margin-top:10px}
+    th,td{padding:8px;border:1px solid #ccc;text-align:left}
     th{background:#333;color:#fff}
     tr:nth-child(even){background:#f8f8f8}
     .small{font-size:0.9em;color:#555}
-    .btn{padding:6px 10px;border:none;border-radius:4px;cursor:pointer}
+    .btn{padding:6px 10px;border:none;border-radius:4px;cursor:pointer;margin:2px}
     .btn-allow{background:#4CAF50;color:white}
     .btn-delete{background:#f44336;color:white}
+    .btn-scan{background:#2196F3;color:white;padding:8px 16px;font-size:14px}
+    .policy-block{color:#f44336;font-weight:bold}
+    .policy-warn{color:#ff9800;font-weight:bold}
+    input[type="text"]{padding:6px;border:1px solid #ccc;border-radius:4px}
+    .status-box{background:#e3f2fd;padding:10px;border-radius:4px;margin:10px 0;border-left:4px solid #2196F3}
+    .debug-info{background:#fff3cd;padding:10px;border-radius:4px;margin:10px 0;font-family:monospace;font-size:12px}
   </style>
+  <script>
+    function scanExisting() {
+      if(confirm('This will scan all existing files in watched folders. Continue?')) {
+        fetch('/scan_existing', {method: 'POST'})
+          .then(r => r.json())
+          .then(data => {
+            alert('Scan complete! Found ' + data.scanned + ' files, ' + data.detected + ' with sensitive data.');
+            location.reload();
+          })
+          .catch(e => alert('Error: ' + e));
+      }
+    }
+
+    // Auto-refresh alerts every 5 seconds
+    setInterval(() => {
+      fetch('/alerts')
+        .then(r => r.json())
+        .then(data => {
+          const count = data.length;
+          document.title = count > 0 ? '(' + count + ') Mini DLP Dashboard' : 'Mini DLP Dashboard';
+        });
+    }, 5000);
+  </script>
 </head>
 <body>
-  <h1>Mini DLP Dashboard</h1>
-  <p>Policy Mode: <strong>{{ policy }}</strong> — <a href="{{ url_for('toggle_policy') }}">Toggle</a></p>
-  <h3>Whitelist</h3>
-  <form method="post" action="{{ url_for('add_whitelist') }}">
-    <input name="path" style="width:70%" placeholder="Path to whitelist (file or folder)"/>
-    <button type="submit">Add</button>
-  </form>
-  <ul>
-  {% for w in whitelist %}
-    <li class="small">{{ w }} <a href="{{ url_for('remove_whitelist') }}?path={{ w }}">[remove]</a></li>
-  {% endfor %}
-  </ul>
+  <div class="container">
+    <h1>🛡️ Mini DLP Dashboard</h1>
 
-  <h3>Alerts (most recent first) — Total: {{ alerts|length }}</h3>
-  <table>
-    <tr><th>File</th><th>Rule</th><th>Time</th><th>Status</th><th>Origin</th><th>Actions</th></tr>
-    {% for a in alerts %}
-    <tr>
-      <td style="word-break:break-all">{{ a.file }}</td>
-      <td>{{ a.rule }}</td>
-      <td>{{ a.time }}</td>
-      <td>{{ a.status }}</td>
-      <td>{{ a.origin if a.origin else "unknown" }}</td>
-      <td>
-        <form style="display:inline" method="post" action="{{ url_for('allow_file') }}">
-          <input type="hidden" name="file" value="{{ a.file }}"/>
-          <button class="btn btn-allow" type="submit">Allow</button>
-        </form>
-        <form style="display:inline" method="post" action="{{ url_for('delete_alert') }}">
-          <input type="hidden" name="file" value="{{ a.file }}"/>
-          <button class="btn btn-delete" type="submit">Delete</button>
-        </form>
-      </td>
-    </tr>
-    {% endfor %}
-  </table>
+    <div class="status-box">
+      <strong>Status:</strong> Active monitoring enabled<br>
+      <strong>Policy Mode:</strong> <span class="policy-{{ policy }}">{{ policy.upper() }}</span> — 
+      <a href="{{ url_for('toggle_policy') }}">[Toggle to {{ 'WARN' if policy == 'block' else 'BLOCK' }}]</a><br>
+      <strong>Watched Paths:</strong> {{ watch_paths|join(', ') }}<br>
+      <div style="margin-top:8px;font-size:0.9em;color:#666">
+        {% if policy == 'block' %}
+          🚫 <strong>BLOCK mode:</strong> Files with sensitive data are quarantined immediately.
+        {% else %}
+          ⚠️ <strong>WARN mode:</strong> Files with sensitive data trigger alerts but remain in place.
+        {% endif %}
+      </div>
+    </div>
 
-  <p class="small">Quarantine folder: {{ quarantine }}</p>
-  <p class="small">Watching paths: {{ watch_paths }}</p>
+    <button class="btn btn-scan" onclick="scanExisting()">🔍 Scan Existing Files</button>
+
+    <h3>Whitelist Management</h3>
+    <form method="post" action="{{ url_for('add_whitelist') }}">
+      <input type="text" name="path" style="width:70%" placeholder="Path to whitelist (file or folder)" required/>
+      <button type="submit" class="btn btn-allow">Add to Whitelist</button>
+    </form>
+    <ul>
+    {% if whitelist %}
+      {% for w in whitelist %}
+        <li class="small">{{ w }} <a href="{{ url_for('remove_whitelist') }}?path={{ w|urlencode }}">[remove]</a></li>
+      {% endfor %}
+    {% else %}
+      <li class="small"><em>No whitelisted paths</em></li>
+    {% endif %}
+    </ul>
+
+    <h3>Security Alerts — Total: {{ alerts|length }}</h3>
+    {% if alerts %}
+    <p class="small" style="background:#e8f5e9;padding:8px;border-radius:4px;border-left:3px solid #4CAF50">
+      💡 <strong>Tip:</strong> "Allow" restores the file to its original location and whitelists it. "Delete" removes the alert but keeps the file in quarantine.
+    </p>
+    <table>
+      <tr><th>File</th><th>Rule</th><th>Time</th><th>Status</th><th>Origin</th><th>Original Location</th><th>Actions</th></tr>
+      {% for a in alerts %}
+      <tr>
+        <td style="word-break:break-all;max-width:250px">{{ a.file }}</td>
+        <td>{{ a.rule }}</td>
+        <td style="white-space:nowrap">{{ a.time }}</td>
+        <td>{{ a.status }}</td>
+        <td style="font-size:0.85em">{{ a.origin if a.origin else "unknown" }}</td>
+        <td style="word-break:break-all;max-width:250px;font-size:0.85em">{{ a.original_path if a.original_path else "N/A" }}</td>
+        <td style="white-space:nowrap">
+          <form style="display:inline" method="post" action="{{ url_for('allow_file') }}">
+            <input type="hidden" name="file" value="{{ a.file }}"/>
+            <button class="btn btn-allow" type="submit" title="Restore to original location and whitelist">✓ Allow</button>
+          </form>
+          <form style="display:inline" method="post" action="{{ url_for('delete_alert') }}">
+            <input type="hidden" name="file" value="{{ a.file }}"/>
+            <button class="btn btn-delete" type="submit" title="Remove alert only">✗ Dismiss</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="small"><em>No alerts yet. System is monitoring...</em></p>
+    {% endif %}
+
+    <div class="debug-info">
+      <strong>Debug Info:</strong><br>
+      Quarantine folder: {{ quarantine }}<br>
+      State file: {{ state_file }}<br>
+      Last refresh: {{ now }}
+    </div>
+  </div>
 </body>
 </html>
 """
 
+
 @app.route("/")
 def index():
+    with state_lock:
+        alerts = state.get("alerts", []).copy()
+        whitelist = state.get("whitelist", []).copy()
+        policy = state.get("policy_mode", "block")
+
     return render_template_string(TEMPLATE,
-                                  alerts=state.get("alerts", []),
-                                  whitelist=state.get("whitelist", []),
-                                  policy=state.get("policy_mode", "block"),
+                                  alerts=alerts,
+                                  whitelist=whitelist,
+                                  policy=policy,
                                   quarantine=QUARANTINE_FOLDER,
-                                  watch_paths=WATCH_PATHS)
+                                  state_file=STATE_FILE,
+                                  watch_paths=WATCH_PATHS,
+                                  now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
 
 @app.route("/toggle_policy")
 def toggle_policy():
-    current = state.get("policy_mode", "block")
-    state["policy_mode"] = "warn" if current == "block" else "block"
-    save_state(state)
+    with state_lock:
+        current = state.get("policy_mode", "block")
+        state["policy_mode"] = "warn" if current == "block" else "block"
+        save_state(state)
     return redirect(url_for("index"))
+
 
 @app.route("/add_whitelist", methods=["POST"])
 def add_whitelist():
     p = request.form.get("path", "").strip()
-    if p:
-        state.setdefault("whitelist", [])
-        if p not in state["whitelist"]:
-            state["whitelist"].append(p)
-            save_state(state)
+    if p and os.path.exists(p):
+        with state_lock:
+            state.setdefault("whitelist", [])
+            abs_p = os.path.abspath(p)
+            if abs_p not in state["whitelist"]:
+                state["whitelist"].append(abs_p)
+                save_state(state)
     return redirect(url_for("index"))
+
 
 @app.route("/remove_whitelist")
 def remove_whitelist():
     p = request.args.get("path", "").strip()
-    if p and p in state.get("whitelist", []):
-        state["whitelist"].remove(p)
-        save_state(state)
+    if p:
+        with state_lock:
+            if p in state.get("whitelist", []):
+                state["whitelist"].remove(p)
+                save_state(state)
     return redirect(url_for("index"))
+
 
 @app.route("/allow_file", methods=["POST"])
 def allow_file():
     fpath = request.form.get("file")
-    # if file is in quarantine, move it back to watch (default) and add to whitelist
+    # Find the alert to get original path
+    original_path = None
+
+    with state_lock:
+        for alert in state.get("alerts", []):
+            if alert.get("file") == fpath:
+                original_path = alert.get("original_path")
+                break
+
+    # if file is in quarantine, move it back to its original location
     try:
         if fpath and os.path.exists(fpath):
-            dest = os.path.join(WATCH_FOLDER, os.path.basename(fpath))
-            os.replace(fpath, dest)
-            # add the destination to whitelist so it won't be re-blocked
-            if dest not in state.get("whitelist", []):
-                state.setdefault("whitelist", []).append(dest)
-            # remove any alerts that reference this file
-            state["alerts"] = [a for a in state.get("alerts", []) if a.get("file") != fpath]
-            save_state(state)
+            # Determine destination: use original path if available, otherwise default to watch folder
+            if original_path and os.path.exists(os.path.dirname(original_path)):
+                dest = original_path
+                print(f"[INFO] Restoring file to original location: {dest}")
+            else:
+                # Fallback to watch folder
+                dest = os.path.join(WATCH_FOLDER, os.path.basename(fpath))
+                print(f"[INFO] Restoring file to watch folder (original path not available): {dest}")
+
+            # Move file back
+            shutil.move(fpath, dest)
+
+            # Add the destination to whitelist so it won't be re-blocked
+            with state_lock:
+                state.setdefault("whitelist", [])
+                if dest not in state["whitelist"]:
+                    state["whitelist"].append(dest)
+                # Remove any alerts that reference this file
+                state["alerts"] = [a for a in state.get("alerts", []) if a.get("file") != fpath]
+                save_state(state)
+            _mark_processed(dest)
+            print(f"[INFO] File allowed and whitelisted: {dest}")
     except Exception as e:
         print(f"[ERROR] allow_file failed: {e}")
     return redirect(url_for("index"))
 
+
 @app.route("/delete_alert", methods=["POST"])
 def delete_alert():
     fpath = request.form.get("file")
-    state["alerts"] = [a for a in state.get("alerts", []) if a.get("file") != fpath]
-    save_state(state)
+    with state_lock:
+        state["alerts"] = [a for a in state.get("alerts", []) if a.get("file") != fpath]
+        save_state(state)
     return redirect(url_for("index"))
+
 
 @app.route("/alerts")
 def get_alerts():
-    return jsonify(state.get("alerts", []))
+    with state_lock:
+        alerts = state.get("alerts", []).copy()
+    return jsonify(alerts)
+
+
+@app.route("/scan_existing", methods=["POST"])
+def scan_existing():
+    """Manually scan all existing files in watched directories"""
+    scanned = 0
+    detected = 0
+
+    print("[INFO] Starting manual scan of existing files...")
+
+    for watch_path in WATCH_PATHS:
+        if not os.path.exists(watch_path):
+            continue
+
+        # SAFETY: Verify we're only scanning approved directories
+        abs_watch = os.path.abspath(watch_path).lower()
+        print(f"[SCAN] Scanning directory: {abs_watch}")
+
+        try:
+            for root, dirs, files in os.walk(watch_path):
+                # Skip quarantine folder
+                if QUARANTINE_FOLDER in root:
+                    continue
+
+                # SAFETY: Double-check we're still within the watched directory
+                abs_root = os.path.abspath(root).lower()
+                try:
+                    common = os.path.commonpath([abs_watch, abs_root])
+                    if common != abs_watch:
+                        print(f"[CRITICAL] Attempted to scan outside watch path: {root}")
+                        continue
+                except:
+                    print(f"[CRITICAL] Path validation failed for: {root}")
+                    continue
+
+                for filename in files:
+                    filepath = os.path.join(root, filename)
+
+                    # Skip if recently processed or quarantined
+                    if _is_recently_processed(filepath) or _is_quarantine_path(filepath):
+                        continue
+
+                    # Skip if whitelisted
+                    if is_whitelisted(filepath):
+                        continue
+
+                    print(f"[SCAN] Checking: {filepath}")
+                    scanned += 1
+
+                    rule = contains_sensitive_data(filepath)
+                    if rule:
+                        detected += 1
+                        _mark_processed(filepath)
+
+                        fname = os.path.basename(filepath)
+                        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        origin = _identify_origin(filepath)
+
+                        with state_lock:
+                            policy_mode = state.get("policy_mode", "block")
+
+                        alert = {
+                            "file": filepath,
+                            "rule": rule,
+                            "time": ts,
+                            "status": policy_mode,
+                            "origin": origin,
+                            "original_path": filepath  # Store original path
+                        }
+                        add_alert(alert)
+                        print(f"[ALERT] Found {rule} in {filepath}")
+
+                        if policy_mode == "block":
+                            try:
+                                dest = os.path.join(QUARANTINE_FOLDER, f"{int(time.time())}_{fname}")
+                                shutil.move(filepath, dest)
+                                print(f"[ACTION] Quarantined: {dest}")
+                                with state_lock:
+                                    if state["alerts"]:
+                                        state["alerts"][0]["file"] = dest
+                                    save_state(state)
+                                _mark_processed(dest)
+                            except Exception as e:
+                                print(f"[ERROR] Could not quarantine: {e}")
+        except Exception as e:
+            print(f"[ERROR] Scan error for {watch_path}: {e}")
+
+    print(f"[INFO] Scan complete. Scanned: {scanned}, Detected: {detected}")
+    return jsonify({"scanned": scanned, "detected": detected})
+
 
 def start_flask():
     app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
 
+
 # ========== Main ==========
 if __name__ == "__main__":
+    print("\n" + "=" * 70)
+    print("🛡️  DATA LOSS PREVENTION (DLP) AGENT")
+    print("=" * 70)
+
+    # Show USB monitoring status prominently
+    if ENABLE_USB_MONITORING:
+        print(f"\n⚠️  USB MONITORING: ENABLED")
+        print(f"   USB Drive: {USB_DRIVE}")
+        print("   To disable, set ENABLE_USB_MONITORING = False in code")
+    else:
+        print(f"\n📌 USB MONITORING: DISABLED")
+        print(f"   To enable, set ENABLE_USB_MONITORING = True in code")
+        print(f"   USB Drive location: {USB_DRIVE}")
+
     # sanity checks: ensure watch paths exist (at least log if they don't)
+    print("\n[STARTUP] Checking watch paths...")
     for p in WATCH_PATHS:
-        if not os.path.exists(p):
-            print(f"[WARN] Watch path does not exist or is inaccessible: {p}")
+        if os.path.exists(p):
+            print(f"  ✓ {p} - EXISTS")
+        else:
+            print(f"  ✗ {p} - NOT FOUND (will skip)")
+
     # start one watcher thread per watched path
     threads = []
+    active_watchers = 0
+    print("\n[STARTUP] Starting file system watchers...")
     for p in WATCH_PATHS:
-        t = threading.Thread(target=start_watcher_for_path, args=(p,), daemon=True)
-        t.start()
-        threads.append(t)
+        if os.path.exists(p):
+            t = threading.Thread(target=start_watcher_for_path, args=(p,), daemon=True)
+            t.start()
+            threads.append(t)
+            active_watchers += 1
+        else:
+            print(f"[ERROR] Skipping non-existent path: {p}")
+
+    if active_watchers == 0:
+        print("\n[ERROR] No valid watch paths found! Please check your configuration.")
+        print("Press Ctrl+C to exit...")
+    else:
+        print(f"\n[STARTUP] Started {active_watchers} watcher(s)")
 
     t2 = threading.Thread(target=start_flask, daemon=True)
     t2.start()
-    print("[INFO] DLP agent + dashboard started. Open http://127.0.0.1:5000")
+
+    print("\n" + "=" * 70)
+    print("✓ DLP AGENT READY")
+    print("=" * 70)
+    print(f"\n📊 Dashboard: http://127.0.0.1:5000")
+    print(f"🔍 Monitoring: {active_watchers} path(s)")
+    print(f"📁 Quarantine: {QUARANTINE_FOLDER}")
+    print(f"\nPress Ctrl+C to stop\n")
+    print("=" * 70 + "\n")
+
     try:
         while True:
             time.sleep(0.5)
     except KeyboardInterrupt:
-        print("Exiting...")
+        print("\n[INFO] Shutting down gracefully...")

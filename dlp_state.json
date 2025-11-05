@@ -1,5 +1,9 @@
 {
   "policy_mode": "block",
-  "whitelist": [],
+  "whitelist": [
+    "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\watch\\small_email_test.txt",
+    "D:\\\\small_email_test.txt",
+    "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\watch\\medium_mixed_test.txt"
+  ],
   "alerts": []
 }
