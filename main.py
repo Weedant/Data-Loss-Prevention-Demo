@@ -977,31 +977,31 @@ def export_alerts():
     with state_lock:
         alerts = state.get("alerts", []).copy()
 
-    # Create CSV in memory
-    output = StringIO()
-    writer = csv.writer(output)
+    print(f"[INFO] Exporting {len(alerts)} alerts to CSV")
+
+    # Create CSV content
+    csv_lines = []
 
     # Write header
-    writer.writerow(['File', 'File Size', 'Rule', 'Time', 'Status', 'Origin', 'Original Path'])
+    csv_lines.append('File,File Size,Rule,Time,Status,Origin,Original Path')
 
     # Write data
     for alert in alerts:
-        writer.writerow([
-            alert.get('file', ''),
-            alert.get('file_size', 'N/A'),
-            alert.get('rule', ''),
-            alert.get('time', ''),
-            alert.get('status', ''),
-            alert.get('origin', ''),
-            alert.get('original_path', '')
-        ])
+        # Escape commas and quotes in fields
+        file_path = str(alert.get('file', '')).replace('"', '""')
+        original_path = str(alert.get('original_path', '')).replace('"', '""')
+
+        row = f'"{file_path}","{alert.get("file_size", "N/A")}","{alert.get("rule", "")}","{alert.get("time", "")}","{alert.get("status", "")}","{alert.get("origin", "")}","{original_path}"'
+        csv_lines.append(row)
+
+    csv_content = '\n'.join(csv_lines)
+
+    print(f"[INFO] CSV content size: {len(csv_content)} bytes")
 
     # Create response
-    output.seek(0)
-    response = make_response(output.getvalue())
+    response = Response(csv_content, mimetype='text/csv')
     response.headers[
         "Content-Disposition"] = f"attachment; filename=dlp_alerts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    response.headers["Content-Type"] = "text/csv"
 
     return response
 

@@ -1,13 +1,25 @@
 {
   "policy_mode": "block",
-  "whitelist": [
-    "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\watch\\confidential_document.txt",
-    "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\watch\\small_email_test.txt",
-    "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\watch\\mega_mixed_test.txt",
-    "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\watch\\medium_mixed_test.txt",
-    "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\watch\\large_aadhaar_test.txt",
-    "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\watch\\huge_credit_card_test.txt"
+  "whitelist": [],
+  "alerts": [
+    {
+      "file": "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\quarantine\\1762685907_huge_credit_card_test.txt",
+      "rule": "Aadhaar",
+      "time": "2025-11-09 16:28:27",
+      "status": "block",
+      "origin": "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\watch",
+      "original_path": "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\watch\\huge_credit_card_test.txt",
+      "file_size": "1.1 MB"
+    },
+    {
+      "file": "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\quarantine\\1762685906_confidential_document.txt",
+      "rule": "Confidential",
+      "time": "2025-11-09 16:28:26",
+      "status": "block",
+      "origin": "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\watch",
+      "original_path": "C:\\Users\\VEDANT\\Desktop\\Data_Exfiltration\\watch\\confidential_document.txt",
+      "file_size": "287.6 KB"
+    }
   ],
-  "alerts": [],
-  "last_scan_time": "2025-11-09 16:22:44"
+  "last_scan_time": "2025-11-09 16:28:27"
 }
