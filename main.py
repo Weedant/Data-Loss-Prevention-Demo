@@ -5,10 +5,21 @@ import threading
 import time
 import json
 import shutil
+import csv
+from io import StringIO
 from datetime import datetime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from flask import Flask, request, render_template_string, jsonify, redirect, url_for
+from flask import Flask, request, render_template_string, jsonify, redirect, url_for, Response, make_response
+
+try:
+    from pystray import Icon, Menu, MenuItem
+    from PIL import Image, ImageDraw
+
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+    print("[WARN] pystray not installed. System tray icon disabled. Install with: pip install pystray pillow")
 
 # ========== Config ==========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +28,8 @@ WATCH_FOLDER = r"C:\Users\VEDANT\Desktop\Data_Exfiltration\watch"
 # add your USB drive here (D:\ as requested)
 USB_DRIVE = r"D:\\"
 
+# IMPORTANT: Enable USB monitoring only if you're sure D:\ is your USB drive
+# and not a system partition. Check in File Explorer first!
 ENABLE_USB_MONITORING = True  # Set to True to enable USB monitoring
 
 # Build watch paths based on config
@@ -51,11 +64,15 @@ PATTERNS = {
 default_state = {
     "policy_mode": "block",  # "block" or "warn"
     "whitelist": [],  # list of file paths or directory paths
-    "alerts": []  # stored alerts (most recent first)
+    "alerts": [],  # stored alerts (most recent first)
+    "last_scan_time": None  # timestamp of last manual scan
 }
 
 # Thread lock for state access
 state_lock = threading.Lock()
+
+# Global for system tray icon
+tray_icon = None
 
 
 # ========== Load / Save state ==========
@@ -88,6 +105,9 @@ def add_alert(entry):
         # keep only recent 200 alerts
         state["alerts"] = state_alerts[:200]
         save_state(state)
+
+    # Show system tray notification
+    show_tray_notification(entry)
 
 
 # ========== Processed cache & helpers ==========
@@ -140,6 +160,19 @@ def _is_temp_test_path(path):
 
 def _looks_like_quarantine_name(path):
     return re.match(r"^\d+_", os.path.basename(path)) is not None
+
+
+def get_file_size(filepath):
+    """Get file size in human-readable format"""
+    try:
+        size = os.path.getsize(filepath)
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} TB"
+    except:
+        return "N/A"
 
 
 # ========== Detection ==========
@@ -331,6 +364,7 @@ class DLPHandler(FileSystemEventHandler):
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             # include origin info (which watched path likely triggered this)
             origin = _identify_origin(path)
+            file_size = get_file_size(path)
 
             with state_lock:
                 policy_mode = state.get("policy_mode", "block")
@@ -341,7 +375,8 @@ class DLPHandler(FileSystemEventHandler):
                 "time": ts,
                 "status": policy_mode,
                 "origin": origin,
-                "original_path": path  # Store original path before quarantine
+                "original_path": path,  # Store original path before quarantine
+                "file_size": file_size
             }
             add_alert(alert)
             print(f"[ALERT] {path} matched {rule} (policy: {policy_mode}) origin:{origin}")
@@ -423,6 +458,59 @@ def start_watcher_for_path(path):
     observer.join()
 
 
+# ========== System Tray Icon ==========
+def create_tray_image():
+    """Create a simple icon for system tray"""
+    image = Image.new('RGB', (64, 64), color='white')
+    draw = ImageDraw.Draw(image)
+    # Draw a shield
+    draw.rectangle([10, 10, 54, 54], fill='blue', outline='darkblue')
+    draw.text((20, 22), "DLP", fill='white')
+    return image
+
+
+def show_tray_notification(alert):
+    """Show system tray notification"""
+    global tray_icon
+    if tray_icon and TRAY_AVAILABLE:
+        try:
+            title = f"🚨 DLP Alert: {alert['rule']}"
+            message = f"File: {os.path.basename(alert['file'])}\nAction: {alert['status']}"
+            tray_icon.notify(title, message)
+        except Exception as e:
+            print(f"[WARN] Could not show tray notification: {e}")
+
+
+def on_tray_quit(icon, item):
+    """Quit from system tray"""
+    icon.stop()
+    os._exit(0)
+
+
+def on_tray_open_dashboard(icon, item):
+    """Open dashboard in browser"""
+    import webbrowser
+    webbrowser.open('http://127.0.0.1:5000')
+
+
+def start_system_tray():
+    """Start system tray icon"""
+    global tray_icon
+    if not TRAY_AVAILABLE:
+        return
+
+    try:
+        icon_image = create_tray_image()
+        menu = Menu(
+            MenuItem('Open Dashboard', on_tray_open_dashboard),
+            MenuItem('Quit', on_tray_quit)
+        )
+        tray_icon = Icon("DLP Agent", icon_image, "DLP Agent Running", menu)
+        tray_icon.run()
+    except Exception as e:
+        print(f"[WARN] Could not start system tray: {e}")
+
+
 # ========== Flask dashboard ==========
 app = Flask(__name__)
 TEMPLATE = """
@@ -435,21 +523,34 @@ TEMPLATE = """
     body{font-family:Arial;margin:20px;background:#f5f5f5}
     .container{background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
     table{width:100%;border-collapse:collapse;margin-top:10px}
-    th,td{padding:8px;border:1px solid #ccc;text-align:left}
-    th{background:#333;color:#fff}
+    th,td{padding:8px;border:1px solid #ccc;text-align:left;font-size:0.9em}
+    th{background:#333;color:#fff;position:sticky;top:0}
     tr:nth-child(even){background:#f8f8f8}
     .small{font-size:0.9em;color:#555}
-    .btn{padding:6px 10px;border:none;border-radius:4px;cursor:pointer;margin:2px}
+    .btn{padding:6px 10px;border:none;border-radius:4px;cursor:pointer;margin:2px;font-size:0.85em}
     .btn-allow{background:#4CAF50;color:white}
     .btn-delete{background:#f44336;color:white}
     .btn-scan{background:#2196F3;color:white;padding:8px 16px;font-size:14px}
+    .btn-export{background:#FF9800;color:white;padding:8px 16px;font-size:14px}
+    .btn-bulk{background:#9C27B0;color:white;padding:8px 16px;font-size:14px}
     .policy-block{color:#f44336;font-weight:bold}
     .policy-warn{color:#ff9800;font-weight:bold}
     input[type="text"]{padding:6px;border:1px solid #ccc;border-radius:4px}
     .status-box{background:#e3f2fd;padding:10px;border-radius:4px;margin:10px 0;border-left:4px solid #2196F3}
     .debug-info{background:#fff3cd;padding:10px;border-radius:4px;margin:10px 0;font-family:monospace;font-size:12px}
+    .search-box{margin:15px 0;padding:10px;background:#f5f5f5;border-radius:4px}
+    .search-box input{width:300px;padding:8px;margin-right:10px}
+    .bulk-actions{background:#f3e5f5;padding:10px;border-radius:4px;margin:10px 0;display:none}
+    .bulk-actions.show{display:block}
+    .checkbox-cell{width:30px;text-align:center}
+    .stats{display:flex;gap:20px;margin:15px 0}
+    .stat-card{flex:1;padding:15px;background:#f5f5f5;border-radius:4px;text-align:center}
+    .stat-value{font-size:24px;font-weight:bold;color:#2196F3}
+    .stat-label{font-size:12px;color:#666;margin-top:5px}
   </style>
   <script>
+    let selectedAlerts = new Set();
+
     function scanExisting() {
       if(confirm('This will scan all existing files in watched folders. Continue?')) {
         fetch('/scan_existing', {method: 'POST'})
@@ -462,7 +563,79 @@ TEMPLATE = """
       }
     }
 
-    // Auto-refresh alerts every 5 seconds
+    function exportToCSV() {
+      window.location.href = '/export_alerts';
+    }
+
+    function filterAlerts() {
+      const query = document.getElementById('searchBox').value.toLowerCase();
+      const rows = document.querySelectorAll('#alertsTable tbody tr');
+
+      rows.forEach(row => {
+        const text = row.textContent.toLowerCase();
+        row.style.display = text.includes(query) ? '' : 'none';
+      });
+    }
+
+    function toggleSelection(checkbox, file) {
+      if (checkbox.checked) {
+        selectedAlerts.add(file);
+      } else {
+        selectedAlerts.delete(file);
+      }
+      updateBulkActions();
+    }
+
+    function selectAll(checkbox) {
+      const checkboxes = document.querySelectorAll('.alert-checkbox');
+      checkboxes.forEach(cb => {
+        cb.checked = checkbox.checked;
+        toggleSelection(cb, cb.dataset.file);
+      });
+    }
+
+    function updateBulkActions() {
+      const bulkDiv = document.getElementById('bulkActions');
+      const count = document.getElementById('selectedCount');
+      count.textContent = selectedAlerts.size;
+      bulkDiv.className = selectedAlerts.size > 0 ? 'bulk-actions show' : 'bulk-actions';
+    }
+
+    function bulkAllow() {
+      if (selectedAlerts.size === 0) return;
+      if (!confirm(`Allow ${selectedAlerts.size} selected file(s)?`)) return;
+
+      const files = Array.from(selectedAlerts);
+      fetch('/bulk_allow', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({files: files})
+      })
+      .then(r => r.json())
+      .then(data => {
+        alert(`Processed ${data.success} file(s)`);
+        location.reload();
+      });
+    }
+
+    function bulkDismiss() {
+      if (selectedAlerts.size === 0) return;
+      if (!confirm(`Dismiss ${selectedAlerts.size} selected alert(s)?`)) return;
+
+      const files = Array.from(selectedAlerts);
+      fetch('/bulk_dismiss', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({files: files})
+      })
+      .then(r => r.json())
+      .then(data => {
+        alert(`Dismissed ${data.success} alert(s)`);
+        location.reload();
+      });
+    }
+
+    // Auto-refresh alerts every 10 seconds
     setInterval(() => {
       fetch('/alerts')
         .then(r => r.json())
@@ -470,7 +643,43 @@ TEMPLATE = """
           const count = data.length;
           document.title = count > 0 ? '(' + count + ') Mini DLP Dashboard' : 'Mini DLP Dashboard';
         });
+    }, 10000);
+
+    // Play sound on new alert (optional)
+    let lastAlertCount = {{ alerts|length }};
+    setInterval(() => {
+      fetch('/alerts')
+        .then(r => r.json())
+        .then(data => {
+          if (data.length > lastAlertCount) {
+            playAlertSound();
+          }
+          lastAlertCount = data.length;
+        });
     }, 5000);
+
+    function playAlertSound() {
+      // Create a simple beep sound using Web Audio API
+      try {
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const oscillator = audioContext.createOscillator();
+        const gainNode = audioContext.createGain();
+
+        oscillator.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+
+        oscillator.frequency.value = 800;
+        oscillator.type = 'sine';
+
+        gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+
+        oscillator.start(audioContext.currentTime);
+        oscillator.stop(audioContext.currentTime + 0.5);
+      } catch(e) {
+        console.log('Could not play alert sound');
+      }
+    }
   </script>
 </head>
 <body>
@@ -482,6 +691,7 @@ TEMPLATE = """
       <strong>Policy Mode:</strong> <span class="policy-{{ policy }}">{{ policy.upper() }}</span> — 
       <a href="{{ url_for('toggle_policy') }}">[Toggle to {{ 'WARN' if policy == 'block' else 'BLOCK' }}]</a><br>
       <strong>Watched Paths:</strong> {{ watch_paths|join(', ') }}<br>
+      <strong>Last Manual Scan:</strong> {{ last_scan if last_scan else 'Never' }}<br>
       <div style="margin-top:8px;font-size:0.9em;color:#666">
         {% if policy == 'block' %}
           🚫 <strong>BLOCK mode:</strong> Files with sensitive data are quarantined immediately.
@@ -491,7 +701,23 @@ TEMPLATE = """
       </div>
     </div>
 
+    <div class="stats">
+      <div class="stat-card">
+        <div class="stat-value">{{ alerts|length }}</div>
+        <div class="stat-label">Total Alerts</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value">{{ whitelist|length }}</div>
+        <div class="stat-label">Whitelisted Paths</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value">{{ watch_paths|length }}</div>
+        <div class="stat-label">Monitored Locations</div>
+      </div>
+    </div>
+
     <button class="btn btn-scan" onclick="scanExisting()">🔍 Scan Existing Files</button>
+    <button class="btn btn-export" onclick="exportToCSV()">📥 Export to CSV</button>
 
     <h3>Whitelist Management</h3>
     <form method="post" action="{{ url_for('add_whitelist') }}">
@@ -509,32 +735,63 @@ TEMPLATE = """
     </ul>
 
     <h3>Security Alerts — Total: {{ alerts|length }}</h3>
+
     {% if alerts %}
+    <div class="search-box">
+      <input type="text" id="searchBox" placeholder="Search alerts (file name, rule, origin...)" onkeyup="filterAlerts()">
+      <span class="small">💡 Type to filter alerts in real-time</span>
+    </div>
+
+    <div id="bulkActions" class="bulk-actions">
+      <strong><span id="selectedCount">0</span> selected</strong> — 
+      <button class="btn btn-allow" onclick="bulkAllow()">✓ Allow Selected</button>
+      <button class="btn btn-delete" onclick="bulkDismiss()">✗ Dismiss Selected</button>
+    </div>
+
     <p class="small" style="background:#e8f5e9;padding:8px;border-radius:4px;border-left:3px solid #4CAF50">
-      💡 <strong>Tip:</strong> "Allow" restores the file to its original location and whitelists it. "Delete" removes the alert but keeps the file in quarantine.
+      💡 <strong>Tip:</strong> "Allow" restores the file to its original location and whitelists it. "Dismiss" removes the alert but keeps the file in quarantine.
     </p>
-    <table>
-      <tr><th>File</th><th>Rule</th><th>Time</th><th>Status</th><th>Origin</th><th>Original Location</th><th>Actions</th></tr>
+
+    <table id="alertsTable">
+      <thead>
+        <tr>
+          <th class="checkbox-cell"><input type="checkbox" onchange="selectAll(this)" title="Select all"></th>
+          <th>File</th>
+          <th>Size</th>
+          <th>Rule</th>
+          <th>Time</th>
+          <th>Status</th>
+          <th>Origin</th>
+          <th>Original Location</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
       {% for a in alerts %}
       <tr>
-        <td style="word-break:break-all;max-width:250px">{{ a.file }}</td>
-        <td>{{ a.rule }}</td>
-        <td style="white-space:nowrap">{{ a.time }}</td>
-        <td>{{ a.status }}</td>
+        <td class="checkbox-cell">
+          <input type="checkbox" class="alert-checkbox" data-file="{{ a.file }}" onchange="toggleSelection(this, '{{ a.file }}')">
+        </td>
+        <td style="word-break:break-all;max-width:200px">{{ a.file|basename }}</td>
+        <td style="white-space:nowrap">{{ a.file_size if a.file_size else 'N/A' }}</td>
+        <td><span style="background:#ffeb3b;padding:2px 6px;border-radius:3px;font-weight:bold">{{ a.rule }}</span></td>
+        <td style="white-space:nowrap;font-size:0.85em">{{ a.time }}</td>
+        <td><span style="color:{{ '#f44336' if a.status == 'block' else '#ff9800' }}">{{ a.status }}</span></td>
         <td style="font-size:0.85em">{{ a.origin if a.origin else "unknown" }}</td>
-        <td style="word-break:break-all;max-width:250px;font-size:0.85em">{{ a.original_path if a.original_path else "N/A" }}</td>
+        <td style="word-break:break-all;max-width:200px;font-size:0.85em">{{ a.original_path if a.original_path else "N/A" }}</td>
         <td style="white-space:nowrap">
           <form style="display:inline" method="post" action="{{ url_for('allow_file') }}">
             <input type="hidden" name="file" value="{{ a.file }}"/>
-            <button class="btn btn-allow" type="submit" title="Restore to original location and whitelist">✓ Allow</button>
+            <button class="btn btn-allow" type="submit" title="Restore to original location and whitelist">✓</button>
           </form>
           <form style="display:inline" method="post" action="{{ url_for('delete_alert') }}">
             <input type="hidden" name="file" value="{{ a.file }}"/>
-            <button class="btn btn-delete" type="submit" title="Remove alert only">✗ Dismiss</button>
+            <button class="btn btn-delete" type="submit" title="Remove alert only">✗</button>
           </form>
         </td>
       </tr>
       {% endfor %}
+      </tbody>
     </table>
     {% else %}
     <p class="small"><em>No alerts yet. System is monitoring...</em></p>
@@ -552,12 +809,19 @@ TEMPLATE = """
 """
 
 
+# Custom Jinja2 filter for basename
+@app.template_filter('basename')
+def basename_filter(path):
+    return os.path.basename(path)
+
+
 @app.route("/")
 def index():
     with state_lock:
         alerts = state.get("alerts", []).copy()
         whitelist = state.get("whitelist", []).copy()
         policy = state.get("policy_mode", "block")
+        last_scan = state.get("last_scan_time")
 
     return render_template_string(TEMPLATE,
                                   alerts=alerts,
@@ -566,7 +830,8 @@ def index():
                                   quarantine=QUARANTINE_FOLDER,
                                   state_file=STATE_FILE,
                                   watch_paths=WATCH_PATHS,
-                                  now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                                  now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                  last_scan=last_scan)
 
 
 @app.route("/toggle_policy")
@@ -653,6 +918,94 @@ def delete_alert():
     return redirect(url_for("index"))
 
 
+@app.route("/bulk_allow", methods=["POST"])
+def bulk_allow():
+    """Allow multiple files at once"""
+    data = request.get_json()
+    files = data.get("files", [])
+    success = 0
+
+    for fpath in files:
+        try:
+            # Find original path
+            original_path = None
+            with state_lock:
+                for alert in state.get("alerts", []):
+                    if alert.get("file") == fpath:
+                        original_path = alert.get("original_path")
+                        break
+
+            if fpath and os.path.exists(fpath):
+                if original_path and os.path.exists(os.path.dirname(original_path)):
+                    dest = original_path
+                else:
+                    dest = os.path.join(WATCH_FOLDER, os.path.basename(fpath))
+
+                shutil.move(fpath, dest)
+
+                with state_lock:
+                    state.setdefault("whitelist", [])
+                    if dest not in state["whitelist"]:
+                        state["whitelist"].append(dest)
+                    state["alerts"] = [a for a in state.get("alerts", []) if a.get("file") != fpath]
+                    save_state(state)
+                _mark_processed(dest)
+                success += 1
+                print(f"[INFO] Bulk allowed: {dest}")
+        except Exception as e:
+            print(f"[ERROR] bulk_allow failed for {fpath}: {e}")
+
+    return jsonify({"success": success})
+
+
+@app.route("/bulk_dismiss", methods=["POST"])
+def bulk_dismiss():
+    """Dismiss multiple alerts at once"""
+    data = request.get_json()
+    files = data.get("files", [])
+
+    with state_lock:
+        state["alerts"] = [a for a in state.get("alerts", []) if a.get("file") not in files]
+        save_state(state)
+
+    return jsonify({"success": len(files)})
+
+
+@app.route("/export_alerts")
+def export_alerts():
+    """Export alerts to CSV"""
+    with state_lock:
+        alerts = state.get("alerts", []).copy()
+
+    # Create CSV in memory
+    output = StringIO()
+    writer = csv.writer(output)
+
+    # Write header
+    writer.writerow(['File', 'File Size', 'Rule', 'Time', 'Status', 'Origin', 'Original Path'])
+
+    # Write data
+    for alert in alerts:
+        writer.writerow([
+            alert.get('file', ''),
+            alert.get('file_size', 'N/A'),
+            alert.get('rule', ''),
+            alert.get('time', ''),
+            alert.get('status', ''),
+            alert.get('origin', ''),
+            alert.get('original_path', '')
+        ])
+
+    # Create response
+    output.seek(0)
+    response = make_response(output.getvalue())
+    response.headers[
+        "Content-Disposition"] = f"attachment; filename=dlp_alerts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    response.headers["Content-Type"] = "text/csv"
+
+    return response
+
+
 @app.route("/alerts")
 def get_alerts():
     with state_lock:
@@ -715,6 +1068,7 @@ def scan_existing():
                         fname = os.path.basename(filepath)
                         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         origin = _identify_origin(filepath)
+                        file_size = get_file_size(filepath)
 
                         with state_lock:
                             policy_mode = state.get("policy_mode", "block")
@@ -725,7 +1079,8 @@ def scan_existing():
                             "time": ts,
                             "status": policy_mode,
                             "origin": origin,
-                            "original_path": filepath  # Store original path
+                            "original_path": filepath,
+                            "file_size": file_size
                         }
                         add_alert(alert)
                         print(f"[ALERT] Found {rule} in {filepath}")
@@ -744,6 +1099,11 @@ def scan_existing():
                                 print(f"[ERROR] Could not quarantine: {e}")
         except Exception as e:
             print(f"[ERROR] Scan error for {watch_path}: {e}")
+
+    # Update last scan time
+    with state_lock:
+        state["last_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        save_state(state)
 
     print(f"[INFO] Scan complete. Scanned: {scanned}, Detected: {detected}")
     return jsonify({"scanned": scanned, "detected": detected})
@@ -796,8 +1156,15 @@ if __name__ == "__main__":
     else:
         print(f"\n[STARTUP] Started {active_watchers} watcher(s)")
 
+    # Start Flask in separate thread
     t2 = threading.Thread(target=start_flask, daemon=True)
     t2.start()
+
+    # Start system tray (runs in main thread if available)
+    if TRAY_AVAILABLE:
+        print("[STARTUP] Starting system tray icon...")
+        tray_thread = threading.Thread(target=start_system_tray, daemon=True)
+        tray_thread.start()
 
     print("\n" + "=" * 70)
     print("✓ DLP AGENT READY")
@@ -805,6 +1172,10 @@ if __name__ == "__main__":
     print(f"\n📊 Dashboard: http://127.0.0.1:5000")
     print(f"🔍 Monitoring: {active_watchers} path(s)")
     print(f"📁 Quarantine: {QUARANTINE_FOLDER}")
+    if TRAY_AVAILABLE:
+        print(f"🔔 System tray: Enabled (notifications active)")
+    else:
+        print(f"🔔 System tray: Disabled (install pystray & pillow to enable)")
     print(f"\nPress Ctrl+C to stop\n")
     print("=" * 70 + "\n")
 
